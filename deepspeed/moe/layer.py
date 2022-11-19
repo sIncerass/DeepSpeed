@@ -103,7 +103,7 @@ class MoE(torch.nn.Module):
         self.deepspeed_moe._set_ep_group(
             groups._get_expert_parallel_group(self.expert_group_name))
 
-    def forward(self, hidden_states, used_token=None):
+    def forward(self, hidden_states, used_token=None, **kwargs):
         """ MoE forward
 
         Arguments:
@@ -128,4 +128,4 @@ class MoE(torch.nn.Module):
             coef = self.coefficient(hidden_states)
             coef = torch.nn.functional.softmax(coef, dim=1)
             output = output * coef[..., 0:1] + output_mlp * coef[..., 1:]
-        return output, self.deepspeed_moe.l_aux, self.deepspeed_moe.exp_counts
+        return output #, self.deepspeed_moe.l_aux, self.deepspeed_moe.exp_counts

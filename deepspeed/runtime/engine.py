@@ -1364,7 +1364,7 @@ class DeepSpeedEngine(Module):
             # Overlap and contiguous grads are meaningless in stage 1 and are ignored
             if zero_stage == ZERO_OPTIMIZATION_OPTIMIZER_STATES:
                 overlap_comm = False
-                contiguous_gradients = False
+                # contiguous_gradients = False
                 round_robin_gradients = False
 
             if isinstance(self.module, PipelineModule):
