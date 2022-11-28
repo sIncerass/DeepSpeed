@@ -13,7 +13,27 @@ from .sharded_moe import MOELayer, TopKGate
 from .experts import Experts
 import copy
 import typing
+from .loss_functions import loss_functions
 
+def balance_ratio_to_dict(balance_ratio):
+    # convert float and list balance_ratio to dictionary to be backward compatible
+    if isinstance(balance_ratio, dict):
+        for k in balance_ratio.keys():
+            assert k in loss_functions, f"Unkonwn balance ratio '{k}'"
+    elif isinstance(balance_ratio, float) or isinstance(balance_ratio, int):
+        balance_ratio = {'load_balance': balance_ratio}
+    elif isinstance(balance_ratio, list):
+        # assume the orders are the same
+        num_losses = min(len(loss_functions), len(balance_ratio))
+        balance_ratio_dict = {}
+        for k, v in zip(list(loss_functions.keys())[:num_losses], balance_ratio[:num_losses]):
+            balance_ratio_dict[k] = v
+        balance_ratio = balance_ratio_dict
+    else:
+        raise f"Unknown balance_ratio format: {balance_ratio}"
+
+    if torch.distributed.get_rank() == 0: print(f"MoE loss balance ratio: {balance_ratio}")
+    return balance_ratio
 
 class MoE(torch.nn.Module):
     def __init__(self,
@@ -29,7 +49,10 @@ class MoE(torch.nn.Module):
                  noisy_gate_policy: typing.Optional[str] = None,
                  drop_tokens: bool = True,
                  use_rts=True,
-                 use_tutel: bool = False):
+                 use_tutel: bool = False,
+                 token_drop_type: str = 'random',
+                 balance_ratio=0.01,
+                 ):
         """Initialize an MoE layer.
 
         Arguments:
@@ -65,6 +88,16 @@ class MoE(torch.nn.Module):
         assert noisy_gate_policy is None or noisy_gate_policy in ['None', 'Jitter', 'RSample'], \
             'Unsupported noisy_gate_policy: ' + noisy_gate_policy
 
+        self.balance_ratio = balance_ratio_to_dict(balance_ratio)
+        if token_drop_type is None:
+            if use_rts:
+                self.token_drop_type = 'random'
+            else:
+                self.token_drop_type = 'cut'
+        else:
+            assert token_drop_type in ['cut', 'random', 'routing_weight'], f"Unknown token_drop_type '{token_drop_type}', choose among 'cut', 'random', 'routing_weight'."
+            self.token_drop_type = token_drop_type
+
         experts = Experts(expert, self.num_local_experts, self.expert_group_name)
         self.deepspeed_moe = MOELayer(TopKGate(hidden_size,
                                                num_experts,
@@ -74,7 +107,9 @@ class MoE(torch.nn.Module):
                                                min_capacity,
                                                noisy_gate_policy,
                                                drop_tokens,
-                                               use_rts),
+                                               use_rts,
+                                               self.token_drop_type,
+                                               self.balance_ratio),
                                       experts,
                                       self.expert_group_name,
                                       self.ep_size,

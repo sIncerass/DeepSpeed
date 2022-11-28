@@ -166,6 +166,26 @@ def _top_idx(source, k):
 def _one_hot_to_float(x, num_classes):
     return F.one_hot(x, num_classes=num_classes).float()
 
+from .loss_functions import loss_functions
+from .gate_logs import gate_logs
+def compute_gate_loss(balance_ratio, gate_log_req, **kwargs):
+    # compute gate loss and other logging information
+    loss = torch.empty([], dtype=kwargs['logits'].dtype, device=kwargs['logits'].device).fill_(0)
+    gate_log = {}
+
+    for type, ratio in balance_ratio.items():
+        if ratio > 0:
+            l = loss_functions[type](**kwargs) * ratio
+            gate_log[type] = l
+            loss += l
+    # if torch.distributed.get_rank() == 0:
+    #     print(gate_log)
+
+    for type, required in gate_log_req.items():
+        if required:
+            gate_log[type] = gate_logs[type](**kwargs)
+
+    return loss, gate_log
 
 def top1gating(logits: Tensor,
                capacity_factor: float,
@@ -174,7 +194,9 @@ def top1gating(logits: Tensor,
                noisy_gate_policy: Optional[str] = None,
                drop_tokens: bool = True,
                use_rts: bool = True,
-               use_tutel: bool = False) -> Tuple[Tensor,
+               use_tutel: bool = False,
+               token_drop_type: str = 'cut',
+               balance_ratio: dict = {'load_balance': 0.01} ) -> Tuple[Tensor,
                                                  Tensor,
                                                  Tensor,
                                                  Tensor]:
@@ -194,11 +216,15 @@ def top1gating(logits: Tensor,
         logits_w_noise if noisy_gate_policy == 'RSample' else gates,
         dim=1)
     num_experts = int(gates.shape[1])
+    num_tokens = int(gates.shape[0])
+    num_nonpadding = torch.sum(used_token) if used_token is not None else num_tokens
     mask1 = F.one_hot(indices1_s, num_classes=num_experts)
 
+    gates_nonpadding = gates
     # mask only used tokens
     if used_token is not None:
         mask1 = einsum("s,se->se", used_token, mask1)
+        gates_nonpadding = einsum("s,se->se", used_token, gates)
 
     # gating decisions
     exp_counts = torch.sum(mask1, dim=0).detach().to('cpu')
@@ -208,14 +234,16 @@ def top1gating(logits: Tensor,
         new_capacity = torch.max(exp_counts).to(logits.device)
         dist.all_reduce(new_capacity, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
         capacity = new_capacity
+    
+    raw_mask1 = mask1.clone().detach()
 
     # Compute l_aux
     me = torch.mean(gates, dim=0)
     ce = torch.mean(mask1.float(), dim=0)
-    l_aux = torch.sum(me * ce) * num_experts
+    # l_aux = torch.sum(me * ce) * num_experts
 
     # Random Token Selection
-    if use_rts:
+    if use_rts and token_drop_type == 'random':
         uniform = exp_selection_uniform_map.get(logits.device)
         if uniform is None:
             uniform = torch.distributions.uniform.Uniform(
@@ -226,6 +254,8 @@ def top1gating(logits: Tensor,
             exp_selection_uniform_map[logits.device] = uniform
 
         mask1_rand = mask1 * uniform(mask1.shape)
+    elif token_drop_type == 'routing_weight':
+        mask1_rand = mask1 * gates
     else:
         mask1_rand = mask1
 
@@ -247,9 +277,19 @@ def top1gating(logits: Tensor,
         locations1 = tutel_moe.fast_cumsum_sub_one(mask1)
     else:
         locations1 = torch.cumsum(mask1, dim=0) - 1
+    
+    if token_drop_type == 'cut':
+        #Remove locations outside capacity from mask
+        mask1 = mask1 * torch.lt(locations1, capacity)
 
+    gates1_s = (gates * mask1).sum(dim=1)
+    l_aux, gate_log = compute_gate_loss(balance_ratio, gate_log_req={},
+                                    logits=logits, gates=gates_nonpadding, gates_max=gates1_s,
+                                    raw_mask=raw_mask1, routing_mask=mask1,
+                                    router_prob_fraction=me, token_dispatch_fraction=ce, nonpadding=used_token,
+                                    num_experts=num_experts, num_nonpadding=num_nonpadding)
     if use_tutel:
-        gates1_s = (gates * mask1).sum(dim=1)
+        # gates1_s = (gates * mask1).sum(dim=1)
         locations1_s = torch.sum(locations1 * mask1, dim=1)
         return l_aux, capacity, num_experts, [indices1_s,], [locations1_s,], [gates1_s,], exp_counts
 
@@ -368,7 +408,9 @@ class TopKGate(Module):
                  min_capacity: int = 8,
                  noisy_gate_policy: Optional[str] = None,
                  drop_tokens: bool = True,
-                 use_rts: bool = True) -> None:
+                 use_rts: bool = True,
+                 token_drop_type: str = 'random',
+                 balance_ratio: float = 0.01) -> None:
         super().__init__()
 
         # Only top-1 and top-2 are supported at the moment.
@@ -385,6 +427,8 @@ class TopKGate(Module):
         self.gate_time = 0.0
         self.drop_tokens = drop_tokens
         self.use_rts = use_rts
+        self.balance_ratio = balance_ratio
+        self.token_drop_type = token_drop_type
 
     def forward(
             self,
@@ -414,7 +458,9 @@ class TopKGate(Module):
                 self.noisy_gate_policy if self.training else None,
                 self.drop_tokens,
                 self.use_rts,
-                use_tutel)
+                use_tutel,
+                token_drop_type=self.token_drop_type,
+                balance_ratio=self.balance_ratio,)
 
         else:
             gate_output = top2gating(
